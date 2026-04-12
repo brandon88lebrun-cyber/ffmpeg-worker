@@ -1,0 +1,18 @@
+{
+  "name": "ffmpeg-worker",
+  "version": "1.0.0",
+  "description": "Railway FFmpeg worker — merges video + audio blobs via FFmpeg, uploads to Cloudflare Stream",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "form-data": "^4.0.1",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^11.1.0"
+  }
+}
