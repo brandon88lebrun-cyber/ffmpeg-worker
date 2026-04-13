@@ -4,6 +4,7 @@ const multer = require("multer");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("@ffmpeg-installer/ffmpeg").path;
 const { v4: uuidv4 } = require("uuid");
+const tus = require("tus-js-client");
 const fs = require("fs");
 const path = require("path");
 
@@ -100,32 +101,37 @@ app.post(
         return res.status(500).json({ success: false, error: "Cloudflare credentials not configured" });
       }
 
-      const fileBuffer = fs.readFileSync(outPath);
       const fileSize = fs.statSync(outPath).size;
+      const fileStream = fs.createReadStream(outPath);
 
-      const cfResponse = await fetch(
-        `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/stream`,
-        {
-          method: "POST",
+      const streamUid = await new Promise((resolve, reject) => {
+        const tusUpload = new tus.Upload(fileStream, {
+          endpoint: `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/stream`,
           headers: {
-            "Authorization": `Bearer ${CLOUDFLARE_STREAM_API_TOKEN}`,
-            "Content-Type": "video/mp4",
-            "Content-Length": fileSize.toString(),
+            Authorization: `Bearer ${CLOUDFLARE_STREAM_API_TOKEN}`,
           },
-          body: fileBuffer,
-        }
-      );
-
-      const cfData = await cfResponse.json();
-
-      if (!cfResponse.ok || !cfData.success) {
-        console.error(`[${id}] Cloudflare Stream error:`, JSON.stringify(cfData));
-        cleanup();
-        return res.status(502).json({ success: false, error: "Cloudflare Stream upload failed" });
-      }
-
-      const streamUid = cfData.result.uid;
-      console.log(`[${id}] Upload complete — Stream UID: ${streamUid}`);
+          chunkSize: 50 * 1024 * 1024,
+          metadata: {
+            name: `interview-${id}.mp4`,
+            type: "video/mp4",
+          },
+          uploadSize: fileSize,
+          onError: (err) => {
+            console.error(`[${id}] TUS upload error:`, err);
+            reject(err);
+          },
+          onProgress: (bytesUploaded, bytesTotal) => {
+            const pct = Math.round((bytesUploaded / bytesTotal) * 100);
+            console.log(`[${id}] Upload progress: ${pct}%`);
+          },
+          onSuccess: () => {
+            const uid = tusUpload.url.split("/").pop();
+            console.log(`[${id}] Upload complete — Stream UID: ${uid}`);
+            resolve(uid);
+          },
+        });
+        tusUpload.start();
+      });
 
       cleanup();
       return res.json({ success: true, streamUid });
