@@ -18,6 +18,8 @@ app.use(
     origin: [
       "https://lineage-vault.com",
       "https://www.lineage-vault.com",
+      "https://capsulated.app",
+      "https://www.capsulated.app",
       "http://localhost:3000",
     ],
   })
