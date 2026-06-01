@@ -136,7 +136,7 @@ app.post(
       });
 
       cleanup();
-      return res.json({ success: true, streamUid });
+      return res.json({ success: true, streamUid, bytesUploaded: fileSize });
     } catch (err) {
       console.error(`[${id}] Error:`, err);
       cleanup();
