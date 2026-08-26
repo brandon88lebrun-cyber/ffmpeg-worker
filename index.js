@@ -78,8 +78,13 @@ function downloadToFile(url, dest, redirects = 0) {
   });
 }
 
-/** Small JSON POST with a timeout. Resolves { status, body }. */
-function postJson(url, headers, payload) {
+/**
+ * Small JSON POST with a timeout. Resolves { status, body }. Follows ONE method-preserving
+ * redirect (307/308) — capsulated.app redirects to www.capsulated.app, and a callback that
+ * stops at the redirect would look like a failure. The redirect target must still pass the
+ * callback host allow-list.
+ */
+function postJson(url, headers, payload, redirected = false) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const lib = parsed.protocol === "http:" ? http : https;
@@ -92,6 +97,13 @@ function postJson(url, headers, payload) {
         headers: { "Content-Type": "application/json", "Content-Length": data.length, ...headers },
       },
       (res) => {
+        if ((res.statusCode === 307 || res.statusCode === 308) && res.headers.location && !redirected) {
+          const next = new URL(res.headers.location, url).toString();
+          res.resume();
+          if (!callbackHostAllowed(next)) return resolve({ status: res.statusCode, body: `redirect to disallowed host ${next}` });
+          console.warn(`[callback] ${res.statusCode} → following once to ${next}`);
+          return resolve(postJson(next, headers, payload, true));
+        }
         let body = "";
         res.setEncoding("utf8");
         res.on("data", (c) => { body += c; });

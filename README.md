@@ -61,6 +61,8 @@ The worker then, in the background: streams both URLs to disk (no in-memory buff
 { "jobId": "uuid", "ok": false, "error": "FFmpeg error: …" }
 ```
 
+Use the canonical host in `callbackUrl` (`https://www.capsulated.app/...` — the bare domain redirects to www). The worker follows a single 307/308 redirect as a safety net, but only to a host on the allow-list.
+
 The callback is retried 3× (5 s, 10 s backoff) on network errors or 5xx. A 4xx is treated as final (the app rejected the payload; retrying cannot help). If the callback never lands, the app's cron re-dispatches the job after 30 min — the app's callback route is idempotent, so a duplicate result is a no-op there.
 
 ### `POST /merge` (legacy)
