@@ -2,10 +2,7 @@
 
 Standalone Node.js service that merges a user video (WebM) with an AI audio track using FFmpeg, then uploads the result to Cloudflare Stream.
 
-Two ways in:
-
-- **`POST /jobs`** — the durable, asynchronous path the app uses. Accepts a job (two signed download URLs + a callback URL), answers `202` immediately, processes in the background, and POSTs the result to the callback.
-- **`POST /merge`** — the legacy synchronous path (multipart upload, response after the merge). Kept for one deploy cycle; remove once the app's `/jobs` flow is live.
+One way in: **`POST /jobs`** — durable and asynchronous. The app hands over a job (two signed download URLs + a callback URL), gets `202` immediately, and the worker processes in the background and POSTs the result to the callback. Server-to-server only; no browser ever calls this service (there is no CORS layer).
 
 ## Deploy to Railway
 
@@ -64,9 +61,6 @@ The worker then, in the background: streams both URLs to disk (no in-memory buff
 Use the canonical host in `callbackUrl` (`https://www.capsulated.app/...` — the bare domain redirects to www). The worker follows a single 307/308 redirect as a safety net, but only to a host on the allow-list.
 
 The callback is retried 3× (5 s, 10 s backoff) on network errors or 5xx. A 4xx is treated as final (the app rejected the payload; retrying cannot help). If the callback never lands, the app's cron re-dispatches the job after 30 min — the app's callback route is idempotent, so a duplicate result is a no-op there.
-
-### `POST /merge` (legacy)
-Multipart form with `userVideo` (WebM) and `aiAudio` (WebM/WAV). Returns `{ "success": true, "streamUid": "…", "bytesUploaded": n }` after the whole merge — the caller must keep the connection open (5-minute server timeout). In-memory upload, 500 MB cap.
 
 ## Smoke test
 

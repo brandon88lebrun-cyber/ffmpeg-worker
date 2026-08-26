@@ -1,9 +1,6 @@
 const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("@ffmpeg-installer/ffmpeg").path;
-const { v4: uuidv4 } = require("uuid");
 const tus = require("tus-js-client");
 const fs = require("fs");
 const path = require("path");
@@ -28,17 +25,8 @@ const ALLOWED_CALLBACK_HOSTS = (process.env.ALLOWED_CALLBACK_HOSTS || "capsulate
 const TMP_DIR = process.env.TMP_DIR || "/tmp";
 const CALLBACK_RETRIES = 3;
 
-app.use(
-  cors({
-    origin: [
-      "https://lineage-vault.com",
-      "https://www.lineage-vault.com",
-      "https://capsulated.app",
-      "https://www.capsulated.app",
-      "http://localhost:3000",
-    ],
-  })
-);
+// Server-to-server only (the app's server actions and cron call /jobs; the worker calls back).
+// No browser ever talks to this service any more, so there is no CORS layer.
 app.use(express.json({ limit: "64kb" }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────────────────
@@ -134,7 +122,7 @@ function streamUidFromTusUrl(url) {
   return seg.replace(/[^A-Za-z0-9_-]/g, "");
 }
 
-// ── The pipeline (unchanged from /merge): FFmpeg merge → TUS upload to Stream ──────────────
+// ── The pipeline: FFmpeg merge → TUS upload to Stream ─────────────────────────────────────
 
 function runFfmpegMerge(id, userPath, aiPath, outPath) {
   return new Promise((resolve, reject) => {
@@ -230,44 +218,6 @@ async function mergeAndUpload(id, userPath, aiPath) {
 app.get("/", (_req, res) => {
   res.json({ status: "ok", jobs: { queued: jobQueue.length, running: runningJob ? runningJob.jobId : null } });
 });
-
-// ── /merge — LEGACY, synchronous. Kept for one deploy cycle so an already-open old client
-//    still works; remove (with multer) once the app's /jobs flow is deployed. ────────────────
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 500 * 1024 * 1024 },
-});
-
-app.post(
-  "/merge",
-  upload.fields([
-    { name: "userVideo", maxCount: 1 },
-    { name: "aiAudio", maxCount: 1 },
-  ]),
-  async (req, res) => {
-    const id = uuidv4();
-    const userPath = path.join(TMP_DIR, `user-${id}.webm`);
-    const aiPath = path.join(TMP_DIR, `ai-${id}.webm`);
-
-    try {
-      if (!req.files?.userVideo?.[0] || !req.files?.aiAudio?.[0]) {
-        return res.status(400).json({ success: false, error: "Both userVideo and aiAudio files are required" });
-      }
-
-      fs.writeFileSync(userPath, req.files.userVideo[0].buffer);
-      fs.writeFileSync(aiPath, req.files.aiAudio[0].buffer);
-
-      const { streamUid, bytesUploaded } = await mergeAndUpload(id, userPath, aiPath);
-      return res.json({ success: true, streamUid, bytesUploaded });
-    } catch (err) {
-      console.error(`[${id}] Error:`, err);
-      return res.status(500).json({ success: false, error: err.message });
-    } finally {
-      cleanupFiles([userPath, aiPath]);
-    }
-  }
-);
 
 // ── /jobs — durable, asynchronous. The app owns the job record; this process keeps nothing
 //    it needs to survive a restart (the app's cron re-dispatches anything that stalls). ───────
@@ -422,14 +372,12 @@ async function sendCallback(callbackUrl, payload) {
 // ── Listen ────────────────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
-  const server = app.listen(PORT, () => {
+  // /jobs answers in milliseconds and the merge runs off-request, so Node's default HTTP
+  // timeouts are right; the 5-minute overrides that the synchronous /merge needed are gone.
+  app.listen(PORT, () => {
     console.log(`FFmpeg worker listening on port ${PORT}`);
     console.log(`  /jobs ${WORKER_SECRET ? "enabled" : "DISABLED (WORKER_SECRET unset)"}; callback hosts: ${ALLOWED_CALLBACK_HOSTS.join(", ")}`);
   });
-  // These only matter for the legacy synchronous /merge; /jobs answers in milliseconds.
-  server.timeout = 300_000;
-  server.keepAliveTimeout = 300_000;
-  server.headersTimeout = 310_000;
 } else {
   // Required as a module (tests): expose the pure helpers, do not listen.
   module.exports = { streamUidFromTusUrl, callbackHostAllowed };
