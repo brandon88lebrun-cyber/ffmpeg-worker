@@ -106,6 +106,22 @@ function postJson(url, headers, payload) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Stream UID from the TUS upload URL: the last PATH segment only. Cloudflare now returns
+ * `…/stream/<uid>?tusv2=true`, so a naive split("/").pop() carried the query string and the
+ * app rejected it ("streamUid missing or malformed"). Anything that is not a uid character
+ * is stripped; an empty result is an error, never a callback.
+ */
+function streamUidFromTusUrl(url) {
+  let seg = "";
+  try {
+    seg = new URL(url).pathname.split("/").filter(Boolean).pop() || "";
+  } catch (_) {
+    seg = String(url || "").split("?")[0].split("#")[0].split("/").filter(Boolean).pop() || "";
+  }
+  return seg.replace(/[^A-Za-z0-9_-]/g, "");
+}
+
 // ── The pipeline (unchanged from /merge): FFmpeg merge → TUS upload to Stream ──────────────
 
 function runFfmpegMerge(id, userPath, aiPath, outPath) {
@@ -171,8 +187,12 @@ function uploadToStream(id, outPath) {
         console.log(`[${id}] Upload progress: ${pct}%`);
       },
       onSuccess: () => {
-        const uid = tusUpload.url.split("/").pop();
-        console.log(`[${id}] Upload complete — Stream UID: ${uid}`);
+        const uid = streamUidFromTusUrl(tusUpload.url);
+        if (!uid) {
+          console.error(`[${id}] TUS upload finished but no uid in URL:`, tusUpload.url);
+          return reject(new Error(`no Stream uid in upload URL ${tusUpload.url}`));
+        }
+        console.log(`[${id}] Upload complete — Stream UID: ${uid} (from ${tusUpload.url})`);
         resolve({ streamUid: uid, bytesUploaded: fileSize });
       },
     });
@@ -243,6 +263,30 @@ app.post(
 const jobQueue = [];
 let runningJob = null;
 
+// Results of finished jobs, kept in memory for a while. If the app re-dispatches a job whose
+// merge already succeeded here (its callback was lost, or rejected by a since-fixed bug), the
+// SAME Stream video is reported again instead of re-merging and orphaning a second upload.
+// Lost on restart — then a re-merge is unavoidable and the app's callback dedups by job.
+const RESULT_MEMORY_MS = 6 * 60 * 60 * 1000;
+const RESULT_MEMORY_MAX = 200;
+const completedResults = new Map(); // jobId → { payload, at }
+
+function rememberResult(jobId, payload) {
+  completedResults.set(jobId, { payload, at: Date.now() });
+  if (completedResults.size > RESULT_MEMORY_MAX) {
+    const cutoff = Date.now() - RESULT_MEMORY_MS;
+    for (const [k, v] of completedResults) if (v.at < cutoff) completedResults.delete(k);
+    while (completedResults.size > RESULT_MEMORY_MAX) completedResults.delete(completedResults.keys().next().value);
+  }
+}
+
+function recallResult(jobId) {
+  const hit = completedResults.get(jobId);
+  if (!hit) return null;
+  if (Date.now() - hit.at > RESULT_MEMORY_MS) { completedResults.delete(jobId); return null; }
+  return hit.payload;
+}
+
 function callbackHostAllowed(callbackUrl) {
   let parsed;
   try { parsed = new URL(callbackUrl); } catch (_) { return false; }
@@ -269,6 +313,15 @@ app.post("/jobs", (req, res) => {
   }
   if (!isHttpUrl(callbackUrl) || !callbackHostAllowed(callbackUrl)) {
     return res.status(400).json({ error: "callbackUrl host not allowed" });
+  }
+
+  // Already merged and uploaded here? Re-send the stored result — do not merge again.
+  const remembered = recallResult(jobId);
+  if (remembered) {
+    console.log(`[${jobId}] re-dispatched after a completed merge — re-sending stored result (uid ${remembered.streamUid})`);
+    res.status(202).json({ accepted: true, reused: true });
+    sendCallback(callbackUrl, remembered).catch((err) => console.error(`[${jobId}] re-send failed:`, err.message));
+    return;
   }
 
   // A re-dispatch of a job already queued or running here is a no-op (the app's cron only
@@ -317,6 +370,7 @@ async function processJob(job) {
 
     const { streamUid, bytesUploaded } = await mergeAndUpload(jobId, userPath, aiPath);
     payload = { jobId, ok: true, streamUid, bytesUploaded };
+    rememberResult(jobId, payload);
     console.log(`[${jobId}] done in ${Math.round((Date.now() - started) / 1000)}s`);
   } catch (err) {
     console.error(`[${jobId}] failed:`, err.message);
@@ -355,11 +409,16 @@ async function sendCallback(callbackUrl, payload) {
 
 // ── Listen ────────────────────────────────────────────────────────────────────────────────
 
-const server = app.listen(PORT, () => {
-  console.log(`FFmpeg worker listening on port ${PORT}`);
-  console.log(`  /jobs ${WORKER_SECRET ? "enabled" : "DISABLED (WORKER_SECRET unset)"}; callback hosts: ${ALLOWED_CALLBACK_HOSTS.join(", ")}`);
-});
-// These only matter for the legacy synchronous /merge; /jobs answers in milliseconds.
-server.timeout = 300_000;
-server.keepAliveTimeout = 300_000;
-server.headersTimeout = 310_000;
+if (require.main === module) {
+  const server = app.listen(PORT, () => {
+    console.log(`FFmpeg worker listening on port ${PORT}`);
+    console.log(`  /jobs ${WORKER_SECRET ? "enabled" : "DISABLED (WORKER_SECRET unset)"}; callback hosts: ${ALLOWED_CALLBACK_HOSTS.join(", ")}`);
+  });
+  // These only matter for the legacy synchronous /merge; /jobs answers in milliseconds.
+  server.timeout = 300_000;
+  server.keepAliveTimeout = 300_000;
+  server.headersTimeout = 310_000;
+} else {
+  // Required as a module (tests): expose the pure helpers, do not listen.
+  module.exports = { streamUidFromTusUrl, callbackHostAllowed };
+}
