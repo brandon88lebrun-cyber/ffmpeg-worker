@@ -333,6 +333,13 @@ async function processJob(job) {
     const { streamUid, bytesUploaded } = await mergeAndUpload(jobId, userPath, aiPath);
     payload = { jobId, ok: true, streamUid, bytesUploaded };
     rememberResult(jobId, payload);
+    // The video is on Stream but the app does not know it yet, and this process's memory is
+    // the only place the uid exists. Tell the app NOW ({phase:'uploaded'}, advisory — one small
+    // durable write on its side) so a restart before the final callback lands cannot orphan the
+    // upload: the app's cron completes from the stored uid instead of re-dispatching a merge.
+    // Awaited so it always precedes the final; its outcome is ignored (a 4xx means an app that
+    // does not know the phase yet, and the final still carries everything).
+    await sendCallback(callbackUrl, { jobId, phase: "uploaded", streamUid, bytesUploaded });
     console.log(`[${jobId}] done in ${Math.round((Date.now() - started) / 1000)}s`);
   } catch (err) {
     console.error(`[${jobId}] failed:`, err.message);
@@ -344,28 +351,33 @@ async function processJob(job) {
   await sendCallback(callbackUrl, payload);
 }
 
-/** The callback is the only thing that turns work into a record — retry it with backoff. */
+/**
+ * The callback is the only thing that turns work into a record — retry it with backoff.
+ * Used for the final result AND the advisory {phase:'uploaded'} message; the log tag carries
+ * the phase so the two read apart.
+ */
 async function sendCallback(callbackUrl, payload) {
+  const tag = payload.phase ? `${payload.jobId} ${payload.phase}` : payload.jobId;
   for (let attempt = 1; attempt <= CALLBACK_RETRIES; attempt++) {
     try {
       const { status, body } = await postJson(callbackUrl, { "x-worker-secret": WORKER_SECRET }, payload);
       if (status >= 200 && status < 300) {
-        console.log(`[${payload.jobId}] callback delivered (${status}) ${body.slice(0, 200)}`);
+        console.log(`[${tag}] callback delivered (${status}) ${body.slice(0, 200)}`);
         return true;
       }
       // 4xx means the app rejected the payload itself (or the secret) — retrying the same
       // body cannot help. Log and stop; the app's cron will re-dispatch if the job stalls.
       if (status >= 400 && status < 500) {
-        console.error(`[${payload.jobId}] callback rejected (${status}) ${body.slice(0, 300)} — not retrying`);
+        console.error(`[${tag}] callback rejected (${status}) ${body.slice(0, 300)} — not retrying`);
         return false;
       }
-      console.error(`[${payload.jobId}] callback attempt ${attempt} returned ${status}: ${body.slice(0, 300)}`);
+      console.error(`[${tag}] callback attempt ${attempt} returned ${status}: ${body.slice(0, 300)}`);
     } catch (err) {
-      console.error(`[${payload.jobId}] callback attempt ${attempt} error:`, err.message);
+      console.error(`[${tag}] callback attempt ${attempt} error:`, err.message);
     }
     if (attempt < CALLBACK_RETRIES) await sleep(5_000 * 2 ** (attempt - 1)); // 5s, 10s
   }
-  console.error(`[${payload.jobId}] callback NOT delivered after ${CALLBACK_RETRIES} attempts — the app's cron will re-dispatch`);
+  console.error(`[${tag}] callback NOT delivered after ${CALLBACK_RETRIES} attempts — the app's cron will re-dispatch`);
   return false;
 }
 

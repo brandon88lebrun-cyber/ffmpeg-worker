@@ -47,16 +47,20 @@ Body (JSON):
 - `400` — malformed body, or `callbackUrl` host not in `ALLOWED_CALLBACK_HOSTS`.
 - `503` — `WORKER_SECRET` unset on the worker.
 
-The worker then, in the background: streams both URLs to disk (no in-memory buffering) → FFmpeg merge (libx264 / aac, `amix` of both audio tracks) → TUS upload to Cloudflare Stream → deletes its scratch files → POSTs the callback.
+The worker then, in the background: streams both URLs to disk (no in-memory buffering) → FFmpeg merge (libx264 / aac, `amix` of both audio tracks) → TUS upload to Cloudflare Stream → deletes its scratch files → POSTs the `uploaded` callback, then the final callback.
 
 ### Callback contract
 
-`POST <callbackUrl>` with header `x-worker-secret: <WORKER_SECRET>` and one of:
+`POST <callbackUrl>` with header `x-worker-secret: <WORKER_SECRET>`. Two messages per successful job, one per failed job:
 
 ```json
+{ "jobId": "uuid", "phase": "uploaded", "streamUid": "…", "bytesUploaded": 123456789 }
 { "jobId": "uuid", "ok": true,  "streamUid": "…", "bytesUploaded": 123456789 }
 { "jobId": "uuid", "ok": false, "error": "FFmpeg error: …" }
 ```
+
+- `phase: "uploaded"` is sent the moment the Stream upload finishes, **before** the final. It is advisory: the app stores the uid on the job row so that if this process restarts (or the final callback is lost) before the final lands, the app completes the job from the stored uid instead of re-dispatching a merge that would orphan the first upload. The worker awaits it (so it always precedes the final) but ignores its outcome — an app that does not know the phase answers `400`, which is fine; the final still carries everything.
+- The final (`ok`) message completes the interview or fails the attempt. The app also stores the uid from it before completing.
 
 Use the canonical host in `callbackUrl` (`https://www.capsulated.app/...` — the bare domain redirects to www). The worker follows a single 307/308 redirect as a safety net, but only to a host on the allow-list.
 
