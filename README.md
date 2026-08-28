@@ -66,6 +66,37 @@ Use the canonical host in `callbackUrl` (`https://www.capsulated.app/...` — th
 
 The callback is retried 3× (5 s, 10 s backoff) on network errors or 5xx. A 4xx is treated as final (the app rejected the payload; retrying cannot help). If the callback never lands, the app's cron re-dispatches the job after 30 min — the app's callback route is idempotent, so a duplicate result is a no-op there.
 
+### `POST /export-jobs`
+
+Data export: zip a set of files the app has presigned, plus one JSON document of the user's written content, and PUT the archive to a presigned URL. Same secret header as `/jobs`, same callback allow-list, same 3× callback retry. Shares the one-at-a-time queue with interview merges. No new environment variables — the worker still touches nothing but the URLs it is handed.
+
+Body (JSON, up to 25 MB — `textContentJson` rides in the body):
+
+```json
+{
+  "jobId": "uuid",
+  "callbackUrl": "https://www.capsulated.app/api/export/job-callback",
+  "outputPutUrl": "https://…presigned PUT for the finished zip…",
+  "files": [
+    { "url": "https://…presigned GET…", "zipPath": "vault/photos/2024-beach.jpg" }
+  ],
+  "textContentJson": "{\"letters\":[…]}"
+}
+```
+
+- `zipPath` is the entry's path inside the zip: relative, forward slashes, no `.`/`..` segments, unique across the request. `content/my-content.json` is reserved — that is where `textContentJson` lands.
+- `202 { "accepted": true }` — queued (`duplicate: true` if the same `jobId` is already queued or running).
+- `400` — malformed body, a bad `zipPath`, or a `callbackUrl` host not on the allow-list. `401` / `503` as for `/jobs`.
+
+The worker fetches the files **one at a time**, streaming each straight into the archive (media entries are STORED, not deflated), writes the zip to scratch disk, PUTs it with an exact `Content-Length`, deletes the scratch file, and calls back once:
+
+```json
+{ "jobId": "uuid", "ok": true,  "zipBytes": 123456789, "skippedFiles": ["vault/photos/gone.jpg"] }
+{ "jobId": "uuid", "ok": false, "error": "upload returned 403: …" }
+```
+
+One dead file never kills an export. A file that fails before its headers (404, refused, timeout) is left out; one whose connection drops mid-body is kept as a truncated entry. Both are listed in `skippedFiles` so the app can tell the user. Exports keep no result memory: a re-dispatch after completion rebuilds the zip.
+
 ## Smoke test
 
 ```bash
