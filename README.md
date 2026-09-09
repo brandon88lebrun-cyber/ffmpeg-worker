@@ -122,3 +122,17 @@ node index.js
 ```
 
 Service runs on http://localhost:3001 by default. For local callbacks add `localhost` to `ALLOWED_CALLBACK_HOSTS` (plain `http://localhost` is accepted for that host only).
+
+## PDF rendering (Life Story Book — spike)
+
+`pdf/render.js` turns an HTML string into a PDF with headless Chromium (Puppeteer), `printBackground: true`, no page margins, page size from the document's `@page` rule. `pdf/sample-page.js` is a single 6×9 in book page with fake content — the rendering-path proof, nothing more.
+
+- **Chromium on Railway** comes from the nix `chromium` package (`nixpacks.toml`). Puppeteer's own Chrome download is skipped there (`PUPPETEER_SKIP_DOWNLOAD=true`) because the Nixpacks runtime lacks its shared libraries. Locally, `npm install` downloads Chrome for Testing and the renderer uses that. Resolution order: `PUPPETEER_EXECUTABLE_PATH` → `chromium` on PATH → Puppeteer's download.
+- **Fonts** are bundled in `fonts/` (EB Garamond, OFL) and inlined as data URIs. Use the **static** instances (`EBGaramond-Regular.ttf`, `-Italic.ttf`): Chrome embeds a *variable* font (`[wght]`) as Type3 outline glyphs — no real font in the PDF. Static TrueType embeds as a proper subset (`/FontFile2`).
+- **Paper grain**: `--grain=svg` draws the app's live `feTurbulence` filter (Chrome rasterises it to a full-page bitmap at 72 dpi on every page); `--grain=png` uses `pdf/assets/grain-tile.png`, the same filter pre-rasterised at 3× by `pdf/make-grain-tile.js`, embedded once per document and tiled.
+
+```bash
+node pdf/render-sample.js out.pdf [--grain=svg|png] [--pages=N]
+```
+
+`GET /pdf-sample[?grain=png]` returns the sample PDF inline — mounted only while `PDF_SAMPLE_ENABLED=true` (set it on Railway to check the deployed build's output, then unset it). No secret, no inputs, no queue. There is no `/pdf-jobs` endpoint yet.

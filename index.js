@@ -601,6 +601,37 @@ async function processExportJob(job) {
   await sendCallback(callbackUrl, payload);
 }
 
+// ── /pdf-sample — Life Story Book rendering-path SPIKE. Renders the FAKE sample page
+//    (pdf/sample-page.js) through this service's Chromium and returns the PDF inline, so the
+//    output of the Railway build can be eyeballed in a browser. Mounted only while
+//    PDF_SAMPLE_ENABLED=true; fixed content, no inputs, no callback, no queue. Remove or keep
+//    off once a real /pdf-jobs endpoint exists. ─────────────────────────────────────────────
+
+const PDF_SAMPLE_ENABLED = process.env.PDF_SAMPLE_ENABLED === "true";
+
+if (PDF_SAMPLE_ENABLED) {
+  const { renderHtmlToPdf } = require("./pdf/render");
+  const { buildSampleHtml } = require("./pdf/sample-page");
+
+  app.get("/pdf-sample", async (req, res) => {
+    const grain = req.query.grain === "png" ? "png" : "svg";
+    const started = Date.now();
+    try {
+      const pdf = await renderHtmlToPdf(buildSampleHtml({ grain }));
+      console.log(`[pdf-sample] rendered grain=${grain}: ${pdf.length}B in ${Date.now() - started}ms`);
+      res.set({
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `inline; filename="sample-6x9-${grain}-grain.pdf"`,
+        "Cache-Control": "no-store",
+      });
+      res.send(pdf);
+    } catch (err) {
+      console.error("[pdf-sample] failed:", errText(err));
+      res.status(500).json({ error: errText(err).slice(0, 1000) });
+    }
+  });
+}
+
 // ── Listen ────────────────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
@@ -609,6 +640,10 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`FFmpeg worker listening on port ${PORT}`);
     console.log(`  /jobs ${WORKER_SECRET ? "enabled" : "DISABLED (WORKER_SECRET unset)"}; callback hosts: ${ALLOWED_CALLBACK_HOSTS.join(", ")}`);
+    if (PDF_SAMPLE_ENABLED) {
+      const { resolveExecutablePath } = require("./pdf/render");
+      console.log(`  /pdf-sample enabled; chromium: ${resolveExecutablePath() || "(puppeteer's bundled Chrome for Testing)"}`);
+    }
   });
 } else {
   // Required as a module (tests): expose the pure helpers, do not listen.

@@ -1,0 +1,10 @@
+# Railway (Nixpacks) build config. Adds Chromium for the PDF renderer (pdf/render.js).
+#
+# Puppeteer's own Chrome-for-Testing download is skipped: the Nixpacks runtime image does not
+# carry the shared libraries that binary needs (libnss3, libgbm, …). The nix `chromium` package
+# brings its whole dependency closure with it and lands on PATH, where render.js finds it.
+[phases.setup]
+nixPkgs = ["...", "chromium"]
+
+[variables]
+PUPPETEER_SKIP_DOWNLOAD = "true"
