@@ -7,6 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "archiver": "^7.0.1",
     "express": "^4.21.2",

@@ -97,6 +97,57 @@ The worker fetches the files **one at a time**, streaming each straight into the
 
 One dead file never kills an export. A file that fails before its headers (404, refused, timeout) is left out; one whose connection drops mid-body is kept as a truncated entry. Both are listed in `skippedFiles` so the app can tell the user. Exports keep no result memory: a re-dispatch after completion rebuilds the zip.
 
+### `POST /life-story-jobs`
+
+Life Story Book generation. The app gathers everything the user recorded (under the user's own RLS) and hands the serialized `LifeStoryContent` blob over; the worker plans the chapters, writes them, runs the invention verifier, and posts the finished book back. The worker reads nothing but the body it is given — no Supabase, no storage. Same secret header, same callback allow-list, same 3× callback retry, same one-at-a-time queue as `/jobs` and `/export-jobs`.
+
+Needs `ANTHROPIC_API_KEY` on the worker (the route answers `503` while it is unset). Optional `ANTHROPIC_BOOK_MODEL` / `ANTHROPIC_BOOK_VERIFIER_MODEL` override the models (default `claude-opus-5`; the verifier defaults to the book model). The prompts in `life-story/book-prompts.js` are a verbatim copy of the app's — re-copy when the app's change, never tune them here.
+
+Body (JSON, up to 10 MB):
+
+```json
+{
+  "jobId": "uuid",
+  "callbackUrl": "https://www.capsulated.app/api/life-story/job-callback",
+  "content": { "subject": {…}, "dated": […], "undated": […], "totalWordCount": 6021, … },
+  "plan": { "book_title": "…", "chapters": [ { "chapter_number": 1, "title": "…", "arc_stage": "…", "brief": "…", "source_ids": ["…"] } ] }
+}
+```
+
+- `content` is the app's `LifeStoryContent` (gather-content.ts) as JSON. Items need `sourceId`, `sourceType`, `text`, `wordCount`; at most 5000 items; `sourceId` unique.
+- `plan` is optional: a frozen plan in the planner's own JSON shape skips Stage 1 (tuning only). It is validated at accept time with the same rules a generated plan gets; a bad plan is a `400`, never a queued job.
+- `202 { "accepted": true }` — queued (`duplicate: true` if the same `jobId` is already queued or running; `reused: true` if this job already finished here and the stored book is being re-sent instead of regenerated).
+- `400` — malformed body, bad content, bad plan, or a `callbackUrl` host not on the allow-list. `401` as for `/jobs`. `503` — `WORKER_SECRET` or `ANTHROPIC_API_KEY` unset.
+
+The worker then, in the background: one planning call → one writing call per chapter, in order → one verifier call per chapter → callback. Minutes, not seconds; the app's cron treats a job as stalled well after that. A finished book is remembered in memory for six hours (as `/jobs` remembers a Stream uid) because regenerating is neither free nor idempotent.
+
+```json
+{
+  "jobId": "uuid",
+  "ok": true,
+  "book": {
+    "title": "One True Thing",
+    "chapters": [
+      {
+        "number": 1, "title": "…", "arc_stage": "childhood", "prose": "…",
+        "source_ids": ["iv-1", "le-1"], "photo_refs": ["…"],
+        "paragraph_provenance": [{ "paragraph": 1, "sourceIds": ["iv-1"] }],
+        "verification_status": "verified"
+      }
+    ],
+    "flags": [
+      { "chapter_number": 7, "paragraph_number": 3, "flagged_text": "…", "category": "reason", "reason": "…", "nearest_source": "card-1:hobbies" }
+    ]
+  },
+  "model": "claude-opus-5", "verifierModel": "claude-opus-5",
+  "usage": { "generate": { "calls": 8, "inputTokens": 0, "outputTokens": 0 }, "verify": { "calls": 7, "inputTokens": 0, "outputTokens": 0 } },
+  "warnings": ["…"]
+}
+{ "jobId": "uuid", "ok": false, "error": "generation failed at chapter 3: …" }
+```
+
+`verification_status` per chapter is `verified` (no flags), `flagged`, or `unchecked` (the verifier call failed; the prose still stands). `paragraph_number` is `null` when the verifier could not place a flag. `model`, `verifierModel`, `usage`, and `warnings` are diagnostics for the app's logs, not for storage. A generation failure sends `ok: false` with nothing partial — a half-written book is never a book.
+
 ## Smoke test
 
 ```bash

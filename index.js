@@ -10,6 +10,9 @@ const https = require("https");
 const crypto = require("crypto");
 const { PassThrough } = require("stream");
 const { pipeline, finished } = require("stream/promises");
+const Anthropic = require("@anthropic-ai/sdk");
+const { generateLifeStoryBook, validatePlanJson, BOOK_MODEL } = require("./life-story/generate-book");
+const { verifyBook, BOOK_VERIFIER_MODEL } = require("./life-story/verify-book");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -26,14 +29,19 @@ const ALLOWED_CALLBACK_HOSTS = (process.env.ALLOWED_CALLBACK_HOSTS || "capsulate
   .split(",").map((h) => h.trim().toLowerCase()).filter(Boolean);
 const TMP_DIR = process.env.TMP_DIR || "/tmp";
 const CALLBACK_RETRIES = 3;
+// ANTHROPIC_API_KEY: the model key for /life-story-jobs (the SDK reads it from the environment).
+// That route is refused entirely while it is unset; /jobs and /export-jobs do not need it.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 
 // Server-to-server only (the app's server actions and cron call /jobs; the worker calls back).
 // No browser ever talks to this service any more, so there is no CORS layer.
 //
-// /export-jobs carries the user's written content in its body, so that route mounts its own,
-// larger parser (see EXPORT_BODY_LIMIT). Every other route keeps the 64 kB ceiling.
+// /export-jobs and /life-story-jobs carry the user's written content in their bodies, so each
+// mounts its own, larger parser (EXPORT_BODY_LIMIT / LIFE_STORY_BODY_LIMIT). Every other route
+// keeps the 64 kB ceiling.
+const OWN_PARSER_PATHS = new Set(["/export-jobs", "/life-story-jobs"]);
 const smallJson = express.json({ limit: "64kb" });
-app.use((req, res, next) => (req.path === "/export-jobs" ? next() : smallJson(req, res, next)));
+app.use((req, res, next) => (OWN_PARSER_PATHS.has(req.path) ? next() : smallJson(req, res, next)));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────────────────
 
@@ -311,8 +319,11 @@ async function drainQueue() {
   runningJob = jobQueue.shift();
   const job = runningJob;
   try {
-    // `kind` is set only by /export-jobs; a /jobs entry has none and is an interview merge.
-    await (job.kind === "export" ? processExportJob(job) : processJob(job));
+    // `kind` is set by /export-jobs ("export") and /life-story-jobs ("life-story"); a /jobs
+    // entry has none and is an interview merge.
+    if (job.kind === "export") await processExportJob(job);
+    else if (job.kind === "life-story") await processLifeStoryJob(job);
+    else await processJob(job);
   } catch (err) {
     // processJob reports its own failures; this only catches a bug in the reporting itself.
     console.error(`[${job.jobId}] unhandled:`, err);
@@ -601,6 +612,195 @@ async function processExportJob(job) {
   await sendCallback(callbackUrl, payload);
 }
 
+// ── /life-story-jobs — Life Story Book generation. The app gathers the user's content under
+//    the user's own RLS and hands the serialized blob over; this service plans, writes, and
+//    verifies the book with the model and posts the finished book JSON back. Dumb compute:
+//    no Supabase, no storage, nothing read but the body it was given. Same secret header,
+//    same callback allow-list, same 3× callback retry, same one-at-a-time queue as /jobs and
+//    /export-jobs. The book is a few KB, so it rides in the callback body — no presigned PUT.
+//
+//    Unlike an export, a re-run is NOT idempotent (different prose, a dozen paid model calls),
+//    so a finished book is remembered the way /jobs remembers a Stream uid: a re-dispatch of a
+//    completed job re-sends the stored result instead of generating again. ────────────────────
+
+// The content blob is every narrative item the user recorded (interview transcripts included).
+const LIFE_STORY_BODY_LIMIT = "10mb";
+const LIFE_STORY_MAX_ITEMS = 5000;
+const lifeStoryJson = express.json({ limit: LIFE_STORY_BODY_LIMIT });
+
+/**
+ * Shape check on the handed-over LifeStoryContent (the app's gather-content.ts model): only
+ * what the engine reads. Returns an error string, or null when the blob is usable.
+ */
+function lifeStoryContentError(content) {
+  if (!content || typeof content !== "object" || Array.isArray(content)) return "content must be an object";
+  if (!content.subject || typeof content.subject !== "object") return "content.subject must be an object";
+  if (!Array.isArray(content.dated) || !Array.isArray(content.undated)) return "content.dated and content.undated must be arrays";
+  if (typeof content.totalWordCount !== "number") return "content.totalWordCount must be a number";
+  const total = content.dated.length + content.undated.length;
+  if (total > LIFE_STORY_MAX_ITEMS) return `content has ${total} items; the limit is ${LIFE_STORY_MAX_ITEMS}`;
+  const seen = new Set();
+  for (const [list, items] of [["dated", content.dated], ["undated", content.undated]]) {
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (!it || typeof it !== "object") return `content.${list}[${i}] must be an object`;
+      if (typeof it.sourceId !== "string" || !it.sourceId) return `content.${list}[${i}].sourceId must be a non-empty string`;
+      if (typeof it.sourceType !== "string" || !it.sourceType) return `content.${list}[${i}].sourceType must be a non-empty string`;
+      if (typeof it.text !== "string") return `content.${list}[${i}].text must be a string`;
+      if (typeof it.wordCount !== "number") return `content.${list}[${i}].wordCount must be a number`;
+      if (it.label != null && typeof it.label !== "string") return `content.${list}[${i}].label must be a string or null`;
+      if (it.date != null && typeof it.date !== "string") return `content.${list}[${i}].date must be a string or null`;
+      if (it.year != null && typeof it.year !== "number") return `content.${list}[${i}].year must be a number or null`;
+      if (it.photoRef != null && typeof it.photoRef !== "string") return `content.${list}[${i}].photoRef must be a string or null`;
+      if (it.relation != null && typeof it.relation !== "object") return `content.${list}[${i}].relation must be an object`;
+      if (seen.has(it.sourceId)) return `content: duplicate sourceId ${it.sourceId}`;
+      seen.add(it.sourceId);
+    }
+  }
+  return null;
+}
+
+app.post("/life-story-jobs", lifeStoryJson, (req, res) => {
+  if (!WORKER_SECRET) {
+    console.error("[life-story-jobs] WORKER_SECRET is not set — refusing all jobs");
+    return res.status(503).json({ error: "worker secret not configured" });
+  }
+  if (!safeEqual(req.get("x-worker-secret"), WORKER_SECRET)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  if (!ANTHROPIC_API_KEY) {
+    console.error("[life-story-jobs] ANTHROPIC_API_KEY is not set — refusing all jobs");
+    return res.status(503).json({ error: "anthropic key not configured" });
+  }
+
+  const { jobId, callbackUrl, content, plan } = req.body || {};
+  if (typeof jobId !== "string" || !/^[0-9a-f-]{36}$/i.test(jobId)) {
+    return res.status(400).json({ error: "jobId must be a uuid" });
+  }
+  if (!isHttpUrl(callbackUrl) || !callbackHostAllowed(callbackUrl)) {
+    return res.status(400).json({ error: "callbackUrl host not allowed" });
+  }
+  const contentError = lifeStoryContentError(content);
+  if (contentError) {
+    return res.status(400).json({ error: contentError });
+  }
+  // An optional frozen plan (the JSON shape the planner emits) skips Stage 1. Validated now,
+  // with the same rules a generated plan gets, so a bad plan is a 400 and never a queued job.
+  let frozenPlan = null;
+  let planWarnings = [];
+  if (plan !== undefined && plan !== null) {
+    if (typeof plan !== "object" || Array.isArray(plan)) return res.status(400).json({ error: "plan must be an object" });
+    const validated = validatePlanJson(JSON.stringify(plan), content);
+    if ("error" in validated) return res.status(400).json({ error: `plan rejected: ${validated.error}` });
+    frozenPlan = validated.plan;
+    planWarnings = validated.warnings;
+  }
+
+  // Already generated here? Re-send the stored book — do not generate again.
+  const remembered = recallResult(jobId);
+  if (remembered) {
+    console.log(`[${jobId}] re-dispatched after a completed generation — re-sending stored book (${remembered.book.chapters.length} chapters)`);
+    res.status(202).json({ accepted: true, reused: true });
+    sendCallback(callbackUrl, remembered).catch((err) => console.error(`[${jobId}] re-send failed:`, err.message));
+    return;
+  }
+
+  // Same guard as /jobs: a job already queued or running here is not queued twice.
+  const duplicate = (runningJob && runningJob.jobId === jobId) || jobQueue.some((j) => j.jobId === jobId);
+  if (duplicate) {
+    console.log(`[${jobId}] life story already queued/running — ignoring duplicate dispatch`);
+    return res.status(202).json({ accepted: true, duplicate: true });
+  }
+
+  const itemCount = content.dated.length + content.undated.length;
+  jobQueue.push({ kind: "life-story", jobId, callbackUrl, content, plan: frozenPlan, planWarnings });
+  console.log(`[${jobId}] life story accepted: ${itemCount} items, ${content.totalWordCount} words${frozenPlan ? `, frozen plan (${frozenPlan.chapters.length} chapters)` : ""} (queue length ${jobQueue.length})`);
+  res.status(202).json({ accepted: true });
+  setImmediate(drainQueue);
+});
+
+/**
+ * The callback's `book`: the app's column names, one entry per chapter and one per verifier
+ * flag. paragraph_provenance is the writer's ChapterProvenance[] untouched (migration 234
+ * stores it as-is). A flag the verifier could not place (paragraph 0) is sent with
+ * paragraph_number null, which is what the flags table accepts.
+ */
+function lifeStoryCallbackBook(book, verification) {
+  const byChapter = new Map(verification.results.map((r) => [r.chapterNumber, r]));
+  return {
+    title: book.plan.bookTitle,
+    chapters: book.chapters.map((c) => ({
+      number: c.chapterNumber,
+      title: c.title,
+      arc_stage: c.arcStage,
+      prose: c.prose,
+      source_ids: c.sourceIds,
+      photo_refs: c.photoRefs,
+      paragraph_provenance: c.provenance,
+      verification_status: (byChapter.get(c.chapterNumber) || {}).status || "unchecked",
+    })),
+    flags: verification.results.flatMap((r) =>
+      r.flags.map((f) => ({
+        chapter_number: f.chapterNumber,
+        paragraph_number: f.paragraph > 0 ? f.paragraph : null,
+        flagged_text: f.text,
+        category: f.category,
+        reason: f.reason,
+        nearest_source: f.nearestSourceId,
+      })),
+    ),
+  };
+}
+
+async function processLifeStoryJob(job) {
+  const { jobId, callbackUrl, content, plan, planWarnings } = job;
+  const started = Date.now();
+  const elapsed = () => `${Math.round((Date.now() - started) / 1000)}s`;
+  let payload;
+
+  try {
+    const anthropic = new Anthropic(); // ANTHROPIC_API_KEY from the environment
+    console.log(`[${jobId}] life story: generating with ${BOOK_MODEL}${plan ? " (frozen plan)" : ""}`);
+    const generated = await generateLifeStoryBook(anthropic, content, {
+      plan: plan || undefined,
+      onProgress: (e) => {
+        if (e.kind === "plan_start") console.log(`[${jobId}] ${elapsed()} planning…`);
+        if (e.kind === "plan_done") console.log(`[${jobId}] ${elapsed()} plan: ${e.plan.chapters.length} chapters — "${e.plan.bookTitle}"`);
+        if (e.kind === "chapter_start") console.log(`[${jobId}] ${elapsed()} writing ${e.chapterNumber}. ${e.title}…`);
+        if (e.kind === "chapter_done") console.log(`[${jobId}] ${elapsed()}   chapter ${e.chapter.chapterNumber} done (${e.chapter.wordCount} words)`);
+      },
+    });
+    if (generated.status !== "ok") {
+      const where = generated.stage === "chapter" ? `chapter ${generated.chapterNumber}` : "plan";
+      throw new Error(`generation failed at ${where}: ${generated.error}`);
+    }
+    const { book } = generated;
+
+    console.log(`[${jobId}] ${elapsed()} verifying ${book.chapters.length} chapters with ${BOOK_VERIFIER_MODEL}`);
+    const verification = await verifyBook(anthropic, content, book.chapters, {
+      onChapter: (r) => console.log(`[${jobId}] ${elapsed()}   verify chapter ${r.chapterNumber}: ${r.status}${r.flags.length ? ` (${r.flags.length} flags)` : ""}${r.error ? ` — ${r.error}` : ""}`),
+    });
+
+    payload = {
+      jobId,
+      ok: true,
+      book: lifeStoryCallbackBook(book, verification),
+      // Diagnostics only — the app logs these; nothing below is persisted.
+      model: book.model,
+      verifierModel: verification.model,
+      usage: { generate: book.usage, verify: verification.usage },
+      warnings: [...planWarnings, ...book.warnings, ...verification.warnings],
+    };
+    rememberResult(jobId, payload);
+    console.log(`[${jobId}] life story done in ${elapsed()}: ${payload.book.chapters.length} chapters, ${payload.book.flags.length} flags, ${book.usage.calls + verification.usage.calls} model calls`);
+  } catch (err) {
+    console.error(`[${jobId}] life story failed:`, errText(err));
+    payload = { jobId, ok: false, error: errText(err).slice(0, 1000) };
+  }
+
+  await sendCallback(callbackUrl, payload);
+}
+
 // ── /pdf-sample — Life Story Book rendering-path SPIKE. Renders the FAKE sample page
 //    (pdf/sample-page.js) through this service's Chromium and returns the PDF inline, so the
 //    output of the Railway build can be eyeballed in a browser. Mounted only while
@@ -640,6 +840,7 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`FFmpeg worker listening on port ${PORT}`);
     console.log(`  /jobs ${WORKER_SECRET ? "enabled" : "DISABLED (WORKER_SECRET unset)"}; callback hosts: ${ALLOWED_CALLBACK_HOSTS.join(", ")}`);
+    console.log(`  /life-story-jobs ${!WORKER_SECRET ? "DISABLED (WORKER_SECRET unset)" : ANTHROPIC_API_KEY ? `enabled; model ${BOOK_MODEL}, verifier ${BOOK_VERIFIER_MODEL}` : "DISABLED (ANTHROPIC_API_KEY unset)"}`);
     if (PDF_SAMPLE_ENABLED) {
       const { resolveExecutablePath } = require("./pdf/render");
       console.log(`  /pdf-sample enabled; chromium: ${resolveExecutablePath() || "(puppeteer's bundled Chrome for Testing)"}`);
