@@ -13,6 +13,8 @@ const { pipeline, finished } = require("stream/promises");
 const Anthropic = require("@anthropic-ai/sdk");
 const { generateLifeStoryBook, validatePlanJson, BOOK_MODEL } = require("./life-story/generate-book");
 const { verifyBook, BOOK_VERIFIER_MODEL } = require("./life-story/verify-book");
+const { renderBook } = require("./pdf/render-book");
+const { resolveExecutablePath } = require("./pdf/render");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -36,10 +38,10 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 // Server-to-server only (the app's server actions and cron call /jobs; the worker calls back).
 // No browser ever talks to this service any more, so there is no CORS layer.
 //
-// /export-jobs and /life-story-jobs carry the user's written content in their bodies, so each
-// mounts its own, larger parser (EXPORT_BODY_LIMIT / LIFE_STORY_BODY_LIMIT). Every other route
-// keeps the 64 kB ceiling.
-const OWN_PARSER_PATHS = new Set(["/export-jobs", "/life-story-jobs"]);
+// /export-jobs, /life-story-jobs and /life-story-pdf-jobs carry the user's written content in
+// their bodies, so each mounts its own, larger parser (EXPORT_BODY_LIMIT / LIFE_STORY_BODY_LIMIT
+// / LIFE_STORY_PDF_BODY_LIMIT). Every other route keeps the 64 kB ceiling.
+const OWN_PARSER_PATHS = new Set(["/export-jobs", "/life-story-jobs", "/life-story-pdf-jobs"]);
 const smallJson = express.json({ limit: "64kb" });
 app.use((req, res, next) => (OWN_PARSER_PATHS.has(req.path) ? next() : smallJson(req, res, next)));
 
@@ -319,10 +321,11 @@ async function drainQueue() {
   runningJob = jobQueue.shift();
   const job = runningJob;
   try {
-    // `kind` is set by /export-jobs ("export") and /life-story-jobs ("life-story"); a /jobs
-    // entry has none and is an interview merge.
+    // `kind` is set by /export-jobs ("export"), /life-story-jobs ("life-story") and
+    // /life-story-pdf-jobs ("life-story-pdf"); a /jobs entry has none and is an interview merge.
     if (job.kind === "export") await processExportJob(job);
     else if (job.kind === "life-story") await processLifeStoryJob(job);
+    else if (job.kind === "life-story-pdf") await processLifeStoryPdfJob(job);
     else await processJob(job);
   } catch (err) {
     // processJob reports its own failures; this only catches a bug in the reporting itself.
@@ -801,11 +804,135 @@ async function processLifeStoryJob(job) {
   await sendCallback(callbackUrl, payload);
 }
 
+// ── /life-story-pdf-jobs — Life Story Book PDF render. The app sends the APPROVED edition's
+//    text (title, subject, chapters in order, each with its photo URLs already resolved) plus
+//    a presigned PUT; this service lays it out as a 6x9 book (pdf/book.js), prints it through
+//    Chromium (pdf/render.js), PUTs the PDF to R2 and calls back status only — the EXPORT
+//    pattern (a PDF is megabytes; a callback body is not), not the generation's in-body one.
+//    Same secret, same callback allow-list, same 3× callback retry, same one-at-a-time queue.
+//    Dumb compute: nothing read but the body it is given.
+//
+//    A render is deterministic and costs seconds, not model calls, so a finished PDF is NOT
+//    remembered the way a generated book is: a re-dispatch renders again and overwrites the
+//    same R2 object (the app hands out the same key). It could not share completedResults
+//    anyway — the generation of the same edition is remembered under the same jobId, and a
+//    book payload must never be re-sent to the render callback. A job already queued or
+//    running here is still deduplicated, by kind AND id. ─────────────────────────────────────
+
+const LIFE_STORY_PDF_BODY_LIMIT = "8mb";
+const LIFE_STORY_PDF_MAX_CHAPTERS = 200;
+const LIFE_STORY_PDF_MAX_PHOTOS_PER_CHAPTER = 40;
+const lifeStoryPdfJson = express.json({ limit: LIFE_STORY_PDF_BODY_LIMIT });
+
+const isHttpsUrl = (u) => typeof u === "string" && /^https:\/\//i.test(u) && u.length < 4096;
+
+/**
+ * Shape check on the `book` the template consumes (pdf/book.js buildBookHtml). Returns an
+ * error string, or null when the book is printable. Strict: a malformed chapter is a 400 at
+ * accept time, never a half-printed book.
+ */
+function lifeStoryPdfBookError(book) {
+  if (!book || typeof book !== "object" || Array.isArray(book)) return "book must be an object";
+  if (typeof book.title !== "string" || !book.title.trim()) return "book.title must be a non-empty string";
+  const s = book.subject;
+  if (!s || typeof s !== "object" || Array.isArray(s)) return "book.subject must be an object";
+  if (s.name != null && typeof s.name !== "string") return "book.subject.name must be a string or null";
+  for (const k of ["birthYear", "deathYear"]) {
+    if (s[k] != null && !Number.isInteger(s[k])) return `book.subject.${k} must be an integer or null`;
+  }
+  if (!Array.isArray(book.chapters) || book.chapters.length === 0) return "book.chapters must be a non-empty array";
+  if (book.chapters.length > LIFE_STORY_PDF_MAX_CHAPTERS) return `book has ${book.chapters.length} chapters; the limit is ${LIFE_STORY_PDF_MAX_CHAPTERS}`;
+  const seen = new Set();
+  for (let i = 0; i < book.chapters.length; i++) {
+    const c = book.chapters[i];
+    if (!c || typeof c !== "object" || Array.isArray(c)) return `book.chapters[${i}] must be an object`;
+    if (!Number.isInteger(c.number) || c.number <= 0) return `book.chapters[${i}].number must be a positive integer`;
+    if (seen.has(c.number)) return `book.chapters: number ${c.number} appears twice`;
+    seen.add(c.number);
+    if (typeof c.title !== "string" || !c.title.trim()) return `book.chapters[${i}].title must be a non-empty string`;
+    if (c.arc != null && typeof c.arc !== "string") return `book.chapters[${i}].arc must be a string or null`;
+    if (typeof c.prose !== "string" || !c.prose.trim()) return `book.chapters[${i}].prose must be a non-empty string`;
+    if (c.photos == null) continue;
+    if (!Array.isArray(c.photos)) return `book.chapters[${i}].photos must be an array`;
+    if (c.photos.length > LIFE_STORY_PDF_MAX_PHOTOS_PER_CHAPTER) return `book.chapters[${i}] has ${c.photos.length} photos; the limit is ${LIFE_STORY_PDF_MAX_PHOTOS_PER_CHAPTER}`;
+    for (let j = 0; j < c.photos.length; j++) {
+      const p = c.photos[j];
+      if (!p || typeof p !== "object" || Array.isArray(p)) return `book.chapters[${i}].photos[${j}] must be an object`;
+      if (p.url != null && !isHttpsUrl(p.url)) return `book.chapters[${i}].photos[${j}].url must be an https url or null`;
+      if (p.caption != null && typeof p.caption !== "string") return `book.chapters[${i}].photos[${j}].caption must be a string or null`;
+    }
+  }
+  return null;
+}
+
+app.post("/life-story-pdf-jobs", lifeStoryPdfJson, (req, res) => {
+  if (!WORKER_SECRET) {
+    console.error("[life-story-pdf-jobs] WORKER_SECRET is not set — refusing all jobs");
+    return res.status(503).json({ error: "worker secret not configured" });
+  }
+  if (!safeEqual(req.get("x-worker-secret"), WORKER_SECRET)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const { jobId, callbackUrl, outputPutUrl, book } = req.body || {};
+  if (typeof jobId !== "string" || !/^[0-9a-f-]{36}$/i.test(jobId)) {
+    return res.status(400).json({ error: "jobId must be a uuid" });
+  }
+  if (!isHttpUrl(callbackUrl) || !callbackHostAllowed(callbackUrl)) {
+    return res.status(400).json({ error: "callbackUrl host not allowed" });
+  }
+  if (!isHttpUrl(outputPutUrl)) {
+    return res.status(400).json({ error: "outputPutUrl must be an http(s) url" });
+  }
+  const bookError = lifeStoryPdfBookError(book);
+  if (bookError) {
+    return res.status(400).json({ error: bookError });
+  }
+
+  const isSame = (j) => j.kind === "life-story-pdf" && j.jobId === jobId;
+  const duplicate = (runningJob && isSame(runningJob)) || jobQueue.some(isSame);
+  if (duplicate) {
+    console.log(`[${jobId}] life story pdf already queued/running — ignoring duplicate dispatch`);
+    return res.status(202).json({ accepted: true, duplicate: true });
+  }
+
+  const photos = book.chapters.reduce((n, c) => n + (c.photos ? c.photos.length : 0), 0);
+  jobQueue.push({ kind: "life-story-pdf", jobId, callbackUrl, outputPutUrl, book });
+  console.log(`[${jobId}] life story pdf accepted: "${book.title}", ${book.chapters.length} chapters, ${photos} photos (queue length ${jobQueue.length})`);
+  res.status(202).json({ accepted: true });
+  setImmediate(drainQueue);
+});
+
+async function processLifeStoryPdfJob(job) {
+  const { jobId, callbackUrl, outputPutUrl, book } = job;
+  const pdfPath = path.join(TMP_DIR, `life-story-${jobId}.pdf`);
+  const started = Date.now();
+  let payload;
+
+  try {
+    console.log(`[${jobId}] life story pdf: rendering "${book.title}", ${book.chapters.length} chapters`);
+    const { pdf, meta } = await renderBook(book);
+    fs.writeFileSync(pdfPath, pdf);
+    console.log(`[${jobId}] life story pdf: ${pdf.length}B, ${meta.pages} pages (${meta.images} photos, ${meta.missing} placeholders) in ${Math.round((Date.now() - started) / 1000)}s — uploading`);
+    await putFile(outputPutUrl, pdfPath, pdf.length, "application/pdf");
+    payload = { jobId, ok: true, pdfBytes: pdf.length, pages: meta.pages, photos: meta.images, placeholders: meta.missing };
+    console.log(`[${jobId}] life story pdf done in ${Math.round((Date.now() - started) / 1000)}s`);
+  } catch (err) {
+    console.error(`[${jobId}] life story pdf failed:`, errText(err));
+    payload = { jobId, ok: false, error: errText(err).slice(0, 1000) };
+  } finally {
+    cleanupFiles([pdfPath]);
+  }
+
+  await sendCallback(callbackUrl, payload);
+}
+
 // ── /pdf-sample — Life Story Book rendering-path SPIKE. Renders the FAKE sample page
 //    (pdf/sample-page.js) through this service's Chromium and returns the PDF inline, so the
 //    output of the Railway build can be eyeballed in a browser. Mounted only while
-//    PDF_SAMPLE_ENABLED=true; fixed content, no inputs, no callback, no queue. Remove or keep
-//    off once a real /pdf-jobs endpoint exists. ─────────────────────────────────────────────
+//    PDF_SAMPLE_ENABLED=true; fixed content, no inputs, no callback, no queue. Superseded by
+//    /life-story-pdf-jobs above; kept as the quickest "does Chromium run on this build" probe.
+//    ────────────────────────────────────────────────────────────────────────────────────────
 
 const PDF_SAMPLE_ENABLED = process.env.PDF_SAMPLE_ENABLED === "true";
 
@@ -841,10 +968,8 @@ if (require.main === module) {
     console.log(`FFmpeg worker listening on port ${PORT}`);
     console.log(`  /jobs ${WORKER_SECRET ? "enabled" : "DISABLED (WORKER_SECRET unset)"}; callback hosts: ${ALLOWED_CALLBACK_HOSTS.join(", ")}`);
     console.log(`  /life-story-jobs ${!WORKER_SECRET ? "DISABLED (WORKER_SECRET unset)" : ANTHROPIC_API_KEY ? `enabled; model ${BOOK_MODEL}, verifier ${BOOK_VERIFIER_MODEL}` : "DISABLED (ANTHROPIC_API_KEY unset)"}`);
-    if (PDF_SAMPLE_ENABLED) {
-      const { resolveExecutablePath } = require("./pdf/render");
-      console.log(`  /pdf-sample enabled; chromium: ${resolveExecutablePath() || "(puppeteer's bundled Chrome for Testing)"}`);
-    }
+    console.log(`  /life-story-pdf-jobs ${WORKER_SECRET ? "enabled" : "DISABLED (WORKER_SECRET unset)"}; chromium: ${resolveExecutablePath() || "(puppeteer's bundled Chrome for Testing)"}`);
+    if (PDF_SAMPLE_ENABLED) console.log("  /pdf-sample enabled");
   });
 } else {
   // Required as a module (tests): expose the pure helpers, do not listen.

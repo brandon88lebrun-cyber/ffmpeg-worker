@@ -148,6 +148,38 @@ The worker then, in the background: one planning call → one writing call per c
 
 `verification_status` per chapter is `verified` (no flags), `flagged`, or `unchecked` (the verifier call failed; the prose still stands). `paragraph_number` is `null` when the verifier could not place a flag. `model`, `verifierModel`, `usage`, and `warnings` are diagnostics for the app's logs, not for storage. A generation failure sends `ok: false` with nothing partial — a half-written book is never a book.
 
+### `POST /life-story-pdf-jobs`
+
+Life Story Book PDF render. Once the owner approves an edition, the app sends its text — title, subject, the chapters in order with any photo URLs already resolved — plus a presigned PUT for the finished file; the worker lays it out as a 6×9 in book (`pdf/book.js`: cover, half-title, title page, contents with page numbers, chapters with sinkage, drop caps, running heads and folios), prints it through Chromium (`pdf/render.js`), PUTs the PDF to that URL and calls back **status only** — the `/export-jobs` pattern, because a PDF is megabytes. Same secret header, same callback allow-list, same 3× callback retry, same one-at-a-time queue. Nothing read but the body.
+
+Body (JSON, up to 8 MB):
+
+```json
+{
+  "jobId": "uuid",
+  "callbackUrl": "https://www.capsulated.app/api/life-story/render-callback",
+  "outputPutUrl": "https://<r2 presigned PUT>",
+  "book": {
+    "title": "One True Thing",
+    "subject": { "name": "Margaret Ellen Whitfield", "birthYear": 1938, "deathYear": 2024 },
+    "chapters": [
+      { "number": 1, "title": "…", "arc": "childhood", "prose": "…\n\n…", "photos": [ { "url": "https://…", "caption": "…" } ] }
+    ]
+  }
+}
+```
+
+- `jobId` is the edition's id (the same id its generation job used; the worker keeps the two kinds apart).
+- `book.chapters` need `number` (positive, unique), `title`, `prose` (paragraphs separated by blank lines); `arc` optional; at most 200 chapters. `photos` optional, at most 40 per chapter; `url` must be `https` or `null` (a `null` or unreachable photo prints as a placeholder frame, never a broken-image glyph); `caption` optional.
+- `202 { "accepted": true }` — queued (`duplicate: true` if the same job is already queued or running). `400` — malformed body or a `callbackUrl` host not on the allow-list. `401` as for `/jobs`. `503` — `WORKER_SECRET` unset.
+
+A render is deterministic and costs seconds, so no result memory: a re-dispatch renders again and overwrites the same object.
+
+```json
+{ "jobId": "uuid", "ok": true, "pdfBytes": 465997, "pages": 17, "photos": 4, "placeholders": 3 }
+{ "jobId": "uuid", "ok": false, "error": "…" }
+```
+
 ## Smoke test
 
 ```bash
@@ -174,9 +206,15 @@ node index.js
 
 Service runs on http://localhost:3001 by default. For local callbacks add `localhost` to `ALLOWED_CALLBACK_HOSTS` (plain `http://localhost` is accepted for that host only).
 
-## PDF rendering (Life Story Book — spike)
+## PDF rendering (Life Story Book)
 
-`pdf/render.js` turns an HTML string into a PDF with headless Chromium (Puppeteer), `printBackground: true`, no page margins, page size from the document's `@page` rule. `pdf/sample-page.js` is a single 6×9 in book page with fake content — the rendering-path proof, nothing more.
+`pdf/render.js` turns an HTML string into a PDF with headless Chromium (Puppeteer), `printBackground: true`, no page margins, page size from the document's `@page` rule; `renderDocument()` takes a `prepare(page)` hook that runs between load and print. `pdf/book.js` builds the whole book as one document and, in that hook, paginates it with **Paged.js** (`pagedjs`, inlined from `node_modules` so the document stays self-contained): Chromium alone flows text but has no running heads, folios or contents page numbers. After Paged.js has laid the pages out, a script in the document walks them once and writes the running head (subject name verso / chapter title recto), the folio (roman in front matter, arabic from chapter 1, none on display and chapter-opening pages) and the contents numbers into each page — deterministic, and where recto discipline plugs in later (`RECTO_IS_PAGED_LEFT` in `pdf/book.js`). Prose is pre-hyphenated with soft hyphens (`hyphen/en-us`) because the nix Chromium carries no hyphenation dictionaries. `pdf/sample-page.js` is the spike's single fake page; the paper treatment and font rules live there and are reused.
+
+```bash
+node pdf/render-book.js book.json out.pdf [--preview=DIR] [--pages=1,2,3]   # book.json = the `book` of a /life-story-pdf-jobs body
+```
+
+`--preview` screenshots the laid-out pages as PNGs — the way to check a layout change without a PDF viewer.
 
 - **Chromium on Railway** comes from the nix `chromium` package (`nixpacks.toml`). Puppeteer's own Chrome download is skipped there (`PUPPETEER_SKIP_DOWNLOAD=true`) because the Nixpacks runtime lacks its shared libraries. Locally, `npm install` downloads Chrome for Testing and the renderer uses that. Resolution order: `PUPPETEER_EXECUTABLE_PATH` → `chromium` on PATH → Puppeteer's download.
 - **Fonts** are bundled in `fonts/` (EB Garamond, OFL) and inlined as data URIs. Use the **static** instances (`EBGaramond-Regular.ttf`, `-Italic.ttf`): Chrome embeds a *variable* font (`[wght]`) as Type3 outline glyphs — no real font in the PDF. Static TrueType embeds as a proper subset (`/FontFile2`).
@@ -186,4 +224,4 @@ Service runs on http://localhost:3001 by default. For local callbacks add `local
 node pdf/render-sample.js out.pdf [--grain=svg|png] [--pages=N]
 ```
 
-`GET /pdf-sample[?grain=png]` returns the sample PDF inline — mounted only while `PDF_SAMPLE_ENABLED=true` (set it on Railway to check the deployed build's output, then unset it). No secret, no inputs, no queue. There is no `/pdf-jobs` endpoint yet.
+`GET /pdf-sample[?grain=png]` returns the sample PDF inline — mounted only while `PDF_SAMPLE_ENABLED=true` (set it on Railway to check the deployed build's output, then unset it). No secret, no inputs, no queue. The real endpoint is `POST /life-story-pdf-jobs` above.
